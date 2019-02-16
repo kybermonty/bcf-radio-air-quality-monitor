@@ -1,12 +1,15 @@
 #include <application.h>
 
 #define TEMPERATURE_TAG_PUB_NO_CHANGE_INTEVAL (5 * 60 * 1000)
-#define TEMPERATURE_TAG_PUB_VALUE_CHANGE 0.1f
+#define TEMPERATURE_TAG_PUB_VALUE_CHANGE 0.2f
 #define TEMPERATURE_TAG_UPDATE_INTERVAL (30 * 1000)
 
 #define HUMIDITY_TAG_PUB_NO_CHANGE_INTEVAL (5 * 60 * 1000)
-#define HUMIDITY_TAG_PUB_VALUE_CHANGE 1.0f
+#define HUMIDITY_TAG_PUB_VALUE_CHANGE 2.0f
 #define HUMIDITY_TAG_UPDATE_INTERVAL (30 * 1000)
+
+#define LUX_METER_TAG_PUB_NO_CHANGE_INTERVAL (5 * 60 * 1000)
+#define LUX_METER_TAG_UPDATE_INTERVAL (30 * 1000)
 
 #define CO2_PUB_NO_CHANGE_INTERVAL (5 * 60 * 1000)
 #define CO2_PUB_VALUE_CHANGE 50.0f
@@ -16,12 +19,17 @@
 #define BATTERY_UPDATE_INTERVAL (60 * 60 * 1000)
 
 bc_led_t led;
+temperature_tag_t temperature_tag;
+humidity_tag_t humidity_tag;
+lux_meter_tag_t lux_meter;
+event_param_t co2_event_param = { .next_pub = 0 };
 
 static struct
 {
     float_t temperature;
     float_t humidity;
     float_t co2_concentation;
+    float_t illuminance;
 } values;
 
 void application_init(void)
@@ -36,15 +44,15 @@ void application_init(void)
     bc_button_set_event_handler(&button, button_event_handler, NULL);
 
     // Temperature Tag
-    static temperature_tag_t temperature_tag_0_0;
-    temperature_tag_init(BC_I2C_I2C0, BC_TAG_TEMPERATURE_I2C_ADDRESS_DEFAULT, &temperature_tag_0_0);
+    temperature_tag_init(BC_I2C_I2C0, BC_TAG_TEMPERATURE_I2C_ADDRESS_DEFAULT, &temperature_tag);
 
     // Humidity Tag
-    static humidity_tag_t humidity_tag_0_4;
-    humidity_tag_init(BC_TAG_HUMIDITY_REVISION_R3, BC_I2C_I2C0, &humidity_tag_0_4);
+    humidity_tag_init(BC_TAG_HUMIDITY_REVISION_R3, BC_I2C_I2C0, &humidity_tag);
+
+    // Lux Meter Tag
+    lux_meter_tag_init(BC_I2C_I2C0, BC_TAG_LUX_METER_I2C_ADDRESS_DEFAULT, &lux_meter);
 
     // CO2 Module
-    static event_param_t co2_event_param = { .next_pub = 0 };
     bc_module_co2_init();
     bc_module_co2_set_update_interval(CO2_UPDATE_INTERVAL);
     bc_module_co2_set_event_handler(co2_event_handler, &co2_event_param);
@@ -195,6 +203,43 @@ void humidity_tag_event_handler(bc_tag_humidity_t *self, bc_tag_humidity_event_t
     }
 }
 
+static void lux_meter_tag_init(bc_i2c_channel_t i2c_channel, bc_tag_lux_meter_i2c_address_t i2c_address, lux_meter_tag_t *tag)
+{
+    memset(tag, 0, sizeof(*tag));
+
+    tag->param.channel = i2c_address == BC_TAG_LUX_METER_I2C_ADDRESS_DEFAULT ? BC_RADIO_PUB_CHANNEL_R1_I2C0_ADDRESS_DEFAULT : BC_RADIO_PUB_CHANNEL_R1_I2C0_ADDRESS_ALTERNATE;
+
+    bc_tag_lux_meter_init(&tag->self, i2c_channel, i2c_address);
+
+    bc_tag_lux_meter_set_update_interval(&tag->self, LUX_METER_TAG_UPDATE_INTERVAL);
+
+    bc_tag_lux_meter_set_event_handler(&tag->self, lux_meter_event_handler, &tag->param);
+}
+
+void lux_meter_event_handler(bc_tag_lux_meter_t *self, bc_tag_lux_meter_event_t event, void *event_param)
+{
+    float value;
+    event_param_t *param = (event_param_t *)event_param;
+
+    if (event != BC_TAG_LUX_METER_EVENT_UPDATE)
+    {
+        return;
+    }
+
+    if (bc_tag_lux_meter_get_illuminance_lux(self, &value))
+    {
+        if (param->next_pub < bc_scheduler_get_spin_tick())
+        {
+            bc_radio_pub_luminosity(param->channel, &value);
+            param->value = value;
+            param->next_pub = bc_scheduler_get_spin_tick() + LUX_METER_TAG_PUB_NO_CHANGE_INTERVAL;
+
+            values.illuminance = value;
+            bc_scheduler_plan_now(0);
+        }
+    }
+}
+
 void co2_event_handler(bc_module_co2_event_t event, void *event_param)
 {
     event_param_t *param = (event_param_t *) event_param;
@@ -251,11 +296,15 @@ void button_event_handler(bc_button_t *self, bc_button_event_t event, void *even
     {
         bc_led_pulse(&led, 100);
 
-        static uint16_t event_count = 0;
-
-        bc_radio_pub_push_button(&event_count);
-
-        event_count++;
+        temperature_tag.param.next_pub = 0;
+        bc_tag_temperature_measure(&temperature_tag.self);
+        humidity_tag.param.next_pub = 0;
+        bc_tag_humidity_measure(&humidity_tag.self);
+        lux_meter.param.next_pub = 0;
+        bc_tag_lux_meter_measure(&lux_meter.self);
+        co2_event_param.next_pub = 0;
+        bc_module_co2_measure();
+        bc_module_battery_measure();
     }
     else if (event == BC_BUTTON_EVENT_HOLD)
     {
